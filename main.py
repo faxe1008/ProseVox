@@ -25,9 +25,19 @@ META_FILE = os.path.join(OUTPUT_DIR, "metadata.json")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # =========================
-# EPUB parsing
+# Chapter padding seconds (global)
+# =========================
+# Amount of silence (in seconds, float) to add before & after chapter-title segments.
+CHAPTER_PADDING_SECONDS = 1.5  # change this value to your desired padding
+
+# =========================
+# EPUB parsing (now detects headings)
 # =========================
 def extract_paragraphs_from_epub(epub_path):
+    """
+    Returns a list of dicts: {"text": "...", "is_heading": True/False}
+    Preserves document order and treats h1..h6 as headings.
+    """
     book = epub.read_epub(epub_path)
     paragraphs = []
 
@@ -40,60 +50,95 @@ def extract_paragraphs_from_epub(epub_path):
             html = content.decode("utf-8", errors="ignore")
             soup = BeautifulSoup(html, "html.parser")
 
-            for p in soup.find_all("p"):
-                text = p.get_text().strip()
-                if text:
-                    paragraphs.append(text)
+            # find headings and paragraphs in document order
+            for tag in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p"]):
+                text = tag.get_text().strip()
+                if not text:
+                    continue
+                is_heading = tag.name.lower() in {"h1", "h2", "h3", "h4", "h5", "h6"}
+                paragraphs.append({"text": text, "is_heading": is_heading})
 
     return paragraphs
 
 # =========================
-# Paragraph → sentence-safe segments
+# Paragraph → sentence-safe segments (respects headings)
 # =========================
 def split_into_segments(paragraphs, max_chars=1500, min_sentences=3):
     """
-    Strong guarantees:
-      - Segments ALWAYS contain at least `min_sentences` sentences,
-        unless fewer sentences remain in total.
-      - Paragraph boundaries are treated as soft hints, not hard barriers.
-      - Sentence boundaries are never broken.
-      - max_chars is respected when possible, but min_sentences wins.
+    Input: paragraphs is a list where each item can be:
+        - a dict {"text": text, "is_heading": bool}
+        - or a plain string (legacy support)
+
+    Behavior:
+      - Headings are emitted as their own segments with is_chapter=True.
+      - Non-heading paragraphs between headings are flattened to sentences and segmented
+        with the same guarantees as before (min_sentences and max_chars).
+    Returns: list of dicts: {"text": "...", "is_chapter": bool}
     """
 
-    # 1. Flatten all paragraphs into a single sentence stream
-    sentences = []
-    for para in paragraphs:
-        parts = re.split(r'(?<=[.!?])\s+', para)
-        sentences.extend(s.strip() for s in parts if s.strip())
+    # helper: flatten a list of paragraph texts into sentence list
+    def _paragraph_texts_to_sentences(texts):
+        sentences = []
+        for para in texts:
+            parts = re.split(r'(?<=[.!?])\s+', para)
+            sentences.extend(s.strip() for s in parts if s.strip())
+        return sentences
 
     segments = []
-    i = 0
-    n = len(sentences)
+    block_texts = []  # accumulate non-heading paragraph texts
 
-    while i < n:
-        current = []
-        char_count = 0
-
-        # 2. First: force min_sentences
-        while i < n and len(current) < min_sentences:
-            s = sentences[i]
-            current.append(s)
-            char_count += len(s) + 1
-            i += 1
-
-        # 3. Then: grow until max_chars (soft limit)
+    def _flush_block():
+        # Turn accumulated block_texts into sentence-based segments
+        if not block_texts:
+            return
+        sentences = _paragraph_texts_to_sentences(block_texts)
+        i = 0
+        n = len(sentences)
         while i < n:
-            s = sentences[i]
-            if char_count + len(s) + 1 > max_chars:
-                break
-            current.append(s)
-            char_count += len(s) + 1
-            i += 1
+            current = []
+            char_count = 0
+            # force min_sentences
+            while i < n and len(current) < min_sentences:
+                s = sentences[i]
+                current.append(s)
+                char_count += len(s) + 1
+                i += 1
+            # grow until max_chars
+            while i < n:
+                s = sentences[i]
+                if char_count + len(s) + 1 > max_chars:
+                    break
+                current.append(s)
+                char_count += len(s) + 1
+                i += 1
+            segments.append({"text": " ".join(current), "is_chapter": False})
+        block_texts.clear()
 
-        segments.append(" ".join(current))
+    # iterate through paragraphs preserving headings
+    for para in paragraphs:
+        if isinstance(para, dict):
+            text = para.get("text", "").strip()
+            is_heading = bool(para.get("is_heading", False))
+        else:
+            text = str(para).strip()
+            is_heading = False
 
+        if not text:
+            continue
+
+        if is_heading:
+            # flush any accumulated non-heading text first
+            _flush_block()
+            # add heading as its own segment
+            segments.append({"text": text, "is_chapter": True})
+        else:
+            block_texts.append(text)
+
+    # flush any remaining block at the end
+    _flush_block()
+
+    # edge-case: if file was empty, return empty list
     return segments
-
 
 # =========================
 # Loudness normalization (LUFS)
@@ -154,7 +199,11 @@ def preview_trimmed_text(epub_file, skip_start, skip_end):
     out.append("\n--- NARRATED TEXT ---\n")
 
     for p in kept:
-        out.append(p)
+        if isinstance(p, dict):
+            prefix = "[CHAPTER] " if p.get("is_heading", False) else ""
+            out.append(prefix + p.get("text", ""))
+        else:
+            out.append(str(p))
 
     return "\n\n".join(out)
 
@@ -202,14 +251,16 @@ def generate_audiobook(epub_file, skip_start, skip_end, ref_audio, ref_text):
     else:
         paragraphs = extract_paragraphs_from_epub(local_epub)
         trimmed = paragraphs[skip_start: len(paragraphs) - skip_end]
-        texts = split_into_segments(trimmed)
+        # split_into_segments now returns dicts with is_chapter flags
+        seg_dicts = split_into_segments(trimmed)
 
         segments = []
-        for i, text in enumerate(texts, 1):
+        for i, seg in enumerate(seg_dicts, 1):
             segments.append({
                 "index": i,
-                "text": text,
-                "file": f"audiobook_{i:06}.wav"
+                "text": seg["text"],
+                "file": f"audiobook_{i:06}.wav",
+                "is_chapter": bool(seg.get("is_chapter", False))
             })
 
         meta = {
@@ -308,10 +359,21 @@ def generate_audiobook(epub_file, skip_start, skip_end, ref_audio, ref_text):
                 return
 
         audio = wavs[0]
+
+        # Loudness normalization (best-effort)
         try:
             audio = normalize_loudness(audio, sr)
         except Exception:
             pass
+
+        # If this is a chapter heading segment, add padding (silence) before & after
+        if bool(seg.get("is_chapter", False)) and CHAPTER_PADDING_SECONDS and CHAPTER_PADDING_SECONDS > 0:
+            pad_samples = int(round(CHAPTER_PADDING_SECONDS * sr))
+            # ensure dtype is float32 for concatenation (model output is usually float32)
+            if not np.issubdtype(audio.dtype, np.floating):
+                audio = audio.astype(np.float32)
+            silence = np.zeros(pad_samples, dtype=audio.dtype)
+            audio = np.concatenate([silence, audio, silence])
 
         sf.write(out_path, audio, sr)
         generated += 1
